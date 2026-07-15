@@ -124,61 +124,86 @@ async def _query_api(
     cpf: str,
     total: int,
     results: list,
+    errors: list,
     lock: asyncio.Lock,
+    max_retries: int,
+    backoff_base: float,
 ) -> None:
     async with sem:
         formatted = fmt(cpf)
-        found, name = False, ""
-        try:
-            async with session.get(
-                SEARCH_URL,
-                params={
-                    "termo": cpf,
-                    "letraInicial": "",
-                    "pagina": 1,
-                    "tamanhoPagina": 10,
-                    "t": STATIC_TOKEN,
-                },
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 200:
-                    ct = resp.headers.get("Content-Type", "")
-                    if "json" in ct:
-                        found, name = _parse_json(await resp.json())
-        except Exception:
-            pass
+        found, name, parsed = False, "", False
+        last_error = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                async with session.get(
+                    SEARCH_URL,
+                    params={
+                        "termo": cpf,
+                        "letraInicial": "",
+                        "pagina": 1,
+                        "tamanhoPagina": 10,
+                        "t": STATIC_TOKEN,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        ct = resp.headers.get("Content-Type", "")
+                        if "json" in ct:
+                            found, name = _parse_json(await resp.json())
+                            parsed = True
+                            break
+                        last_error = f"content-type inesperado: {ct or 'vazio'}"
+                    else:
+                        last_error = f"HTTP {resp.status}"
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+            if attempt < max_retries:
+                await asyncio.sleep(backoff_base * (2 ** attempt))
 
         async with lock:
-            if found:
+            if parsed and found:
                 results.append({"cpf": formatted, "nome": name})
                 print(f"[{idx:04d}/{total}] {formatted} ... ENCONTRADO — {name or 'nome não disponível'}")
-            else:
+            elif parsed:
                 print(f"[{idx:04d}/{total}] {formatted} ... não encontrado")
+            else:
+                errors.append({"cpf": formatted, "erro": last_error})
+                print(f"[{idx:04d}/{total}] {formatted} ... ERRO (após {max_retries + 1} tentativas) — {last_error}")
 
 
-async def run_api(candidates: list[str], workers: int) -> list[dict]:
+async def run_api(
+    candidates: list[str], workers: int, max_retries: int, backoff_base: float
+) -> tuple[list[dict], list[dict]]:
     total = len(candidates)
     results: list[dict] = []
+    errors: list[dict] = []
     lock = asyncio.Lock()
     sem = asyncio.Semaphore(workers)
 
     conn = aiohttp.TCPConnector(limit=workers * 2, ssl=False)
     async with aiohttp.ClientSession(headers=_API_HEADERS, connector=conn) as session:
         tasks = [
-            _query_api(session, sem, idx, cpf, total, results, lock)
+            _query_api(session, sem, idx, cpf, total, results, errors, lock, max_retries, backoff_base)
             for idx, cpf in enumerate(candidates, 1)
         ]
         await asyncio.gather(*tasks)
 
-    return results
+    return results, errors
 
 
 # ── Modo 2: Playwright (fallback com reCAPTCHA) ───────────────────────────────
 
-async def _query_playwright(browser: Browser, cpf: str, sem: asyncio.Semaphore, debug: bool) -> tuple[bool, str]:
+async def _query_playwright(
+    browser: Browser, cpf: str, sem: asyncio.Semaphore, debug: bool
+) -> tuple[bool, str, bool, str | None]:
+    """Retorna (found, name, parsed, error). `parsed=False` indica falha (timeout,
+    reCAPTCHA bloqueando, resposta inesperada), a diferenciar de um CPF não encontrado."""
     async with sem:
         captured: dict = {}
         ready = asyncio.Event()
+        error: str | None = None
 
         context = await browser.new_context(
             user_agent=_API_HEADERS["User-Agent"],
@@ -200,20 +225,27 @@ async def _query_playwright(browser: Browser, cpf: str, sem: asyncio.Semaphore, 
 
         # Intercepta a chamada AJAX para busca.portaldatransparencia.gov.br
         async def on_response(response):
-            if "busca.portaldatransparencia.gov.br" in response.url and response.status == 200:
-                try:
-                    data = await response.json()
-                    captured["json"] = data
-                    ready.set()
-                except Exception:
-                    pass
+            nonlocal error
+            if "busca.portaldatransparencia.gov.br" in response.url:
+                if response.status == 200:
+                    try:
+                        data = await response.json()
+                        captured["json"] = data
+                        ready.set()
+                    except Exception as e:
+                        error = f"resposta não-JSON: {e}"
+                else:
+                    error = f"HTTP {response.status}"
 
         page.on("response", on_response)
 
-        await page.goto(
-            f"{PORTAL_BASE}/pessoa-fisica/busca/lista?termo={cpf}&pagina=1&tamanhoPagina=10",
-            wait_until="domcontentloaded",
-        )
+        try:
+            await page.goto(
+                f"{PORTAL_BASE}/pessoa-fisica/busca/lista?termo={cpf}&pagina=1&tamanhoPagina=10",
+                wait_until="domcontentloaded",
+            )
+        except Exception as e:
+            error = error or f"falha ao navegar: {e}"
 
         try:
             btn = await page.wait_for_selector(
@@ -227,7 +259,7 @@ async def _query_playwright(browser: Browser, cpf: str, sem: asyncio.Semaphore, 
         try:
             await asyncio.wait_for(ready.wait(), timeout=20.0)
         except asyncio.TimeoutError:
-            pass
+            error = error or "timeout aguardando resposta da busca"
 
         if debug and not _debug_saved.is_set():
             _debug_saved.set()
@@ -243,14 +275,18 @@ async def _query_playwright(browser: Browser, cpf: str, sem: asyncio.Semaphore, 
         await context.close()
 
         if "json" in captured:
-            return _parse_json(captured["json"])
+            found, name = _parse_json(captured["json"])
+            return (found, name, True, None)
 
-        return (False, "")
+        return (False, "", False, error or "sem resposta da API")
 
 
-async def run_playwright(candidates: list[str], workers: int, debug: bool) -> list[dict]:
+async def run_playwright(
+    candidates: list[str], workers: int, debug: bool, max_retries: int, backoff_base: float
+) -> tuple[list[dict], list[dict]]:
     total = len(candidates)
     results: list[dict] = []
+    errors: list[dict] = []
     lock = asyncio.Lock()
     sem = asyncio.Semaphore(workers)
 
@@ -262,38 +298,57 @@ async def run_playwright(candidates: list[str], workers: int, debug: bool) -> li
 
         async def process(idx: int, cpf: str):
             formatted = fmt(cpf)
-            found, name = await _query_playwright(browser, cpf, sem, debug)
+            found, name, parsed, last_error = False, "", False, None
+
+            for attempt in range(max_retries + 1):
+                found, name, parsed, last_error = await _query_playwright(browser, cpf, sem, debug)
+                if parsed:
+                    break
+                if attempt < max_retries:
+                    await asyncio.sleep(backoff_base * (2 ** attempt))
+
             async with lock:
-                if found:
+                if parsed and found:
                     results.append({"cpf": formatted, "nome": name})
                     print(f"[{idx:04d}/{total}] {formatted} ... ENCONTRADO — {name or 'nome não disponível'}")
-                else:
+                elif parsed:
                     print(f"[{idx:04d}/{total}] {formatted} ... não encontrado")
+                else:
+                    errors.append({"cpf": formatted, "erro": last_error})
+                    print(f"[{idx:04d}/{total}] {formatted} ... ERRO (após {max_retries + 1} tentativas) — {last_error}")
 
         await asyncio.gather(*[process(idx, cpf) for idx, cpf in enumerate(candidates, 1)])
         await browser.close()
 
-    return results
+    return results, errors
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
-def _save(mask: str, results: list[dict], total: int) -> None:
+def _save(mask: str, results: list[dict], errors: list[dict], total: int) -> None:
     results.sort(key=lambda r: r["cpf"])
+    errors.sort(key=lambda r: r["cpf"])
     output_file = mask + ".txt"
+    checked = total - len(errors)
     print("-" * 50)
-    print(f"Total encontrado: {len(results)}/{total}")
+    print(f"Total encontrado: {len(results)}/{checked} verificados ({len(errors)} com erro de {total} candidatos)")
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("zcpf-finder — busca por máscara\n")
         f.write(f"Máscara : {mask}\n")
         f.write(f"Data    : {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-        f.write(f"Resultado: {len(results)} encontrado(s) de {total} candidato(s)\n")
+        f.write(f"Resultado: {len(results)} encontrado(s) de {checked} verificado(s) "
+                f"({len(errors)} com erro de {total} candidato(s))\n")
         f.write("=" * 50 + "\n\n")
         for r in results:
             line = r["cpf"] + (f" — {r['nome']}" if r["nome"] else "")
             f.write(line + "\n")
         if not results:
             f.write("Nenhum CPF encontrado.\n")
+        if errors:
+            f.write("\n" + "-" * 50 + "\n")
+            f.write(f"CPFs não verificados por erro ({len(errors)}) — refaça a busca para conferir:\n\n")
+            for e in errors:
+                f.write(f"{e['cpf']} — ERRO: {e['erro']}\n")
     print(f"Resultados salvos em: {output_file}")
 
 
@@ -311,10 +366,17 @@ def main() -> None:
                         help="Salva debug.html / debug.json da primeira consulta")
     parser.add_argument("--force-playwright", action="store_true",
                         help="Força uso do Playwright mesmo se API direta funcionar")
+    parser.add_argument("--retries", type=int, default=3, metavar="N",
+                        help="Tentativas extras por CPF antes de marcar como erro (padrão: 3)")
+    parser.add_argument("--backoff", type=float, default=1.0, metavar="SEGUNDOS",
+                        help="Base do backoff exponencial entre tentativas, em segundos (padrão: 1.0)")
     args = parser.parse_args()
 
     if args.workers < 1:
         print("[ERRO] --workers deve ser >= 1")
+        sys.exit(1)
+    if args.retries < 0:
+        print("[ERRO] --retries deve ser >= 0")
         sys.exit(1)
 
     candidates = generate_candidates(args.mask)
@@ -340,12 +402,13 @@ def main() -> None:
         print("-" * 50)
 
         if use_api:
-            return await run_api(candidates, workers)
+            return await run_api(candidates, workers, args.retries, args.backoff)
         else:
-            return await run_playwright(candidates, workers, debug=args.debug)
+            return await run_playwright(candidates, workers, debug=args.debug,
+                                          max_retries=args.retries, backoff_base=args.backoff)
 
-    results = asyncio.run(_main())
-    _save(args.mask, results, total)
+    results, errors = asyncio.run(_main())
+    _save(args.mask, results, errors, total)
 
 
 if __name__ == "__main__":
